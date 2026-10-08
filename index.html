@@ -20,6 +20,8 @@
   .status b { color: var(--muted); font-weight: 500; }
   button { font: inherit; padding: 8px 16px; border: 0; border-radius: 8px; background: var(--accent); color: #fff; }
   button:disabled { opacity: .4; }
+  #test-input { display: block; width: 100%; margin-top: 8px; padding: 10px 12px; font: 18px ui-monospace, monospace;
+    background: var(--bg); color: var(--text); border: 1px solid var(--muted); border-radius: 8px; }
   #last { border-left: 6px solid var(--muted); min-height: 120px; }
   #last.ok { border-color: var(--ok); }
   #last.error { border-color: var(--err); }
@@ -48,6 +50,11 @@
     <span><b>Web NFC:</b> <span id="nfc-status">checking…</span></span>
     <button id="nfc-start" disabled>Start NFC scan</button>
     <button id="copy-report">Copy report</button>
+  </section>
+
+  <section class="panel">
+    <label for="test-input"><b style="color:var(--muted);font-weight:500">Test input</b> — optional: tap here, then scan a badge</label>
+    <input id="test-input" type="text" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="Badge ID appears here…">
   </section>
 
   <section id="last" class="panel">
@@ -126,6 +133,8 @@ let flushTimer;
 let warnedUnidentified = false;
 
 document.addEventListener('keydown', e => {
+  // Typing into the test input is handled by its own listeners below.
+  if (e.target === testInput) return;
   clearTimeout(flushTimer);
   // Android soft keyboards/IMEs report key "Unidentified" (keyCode 229) instead of real characters.
   if ((e.key === 'Unidentified' || e.keyCode === 229) && !warnedUnidentified) {
@@ -148,12 +157,40 @@ function flushKeyboard() {
   clearTimeout(flushTimer);
   const raw = buffer;
   buffer = '';
+  handleKeyboardValue(raw, 'keyboard reader');
+}
+
+function handleKeyboardValue(raw, source) {
   if (!raw) return;
   if (raw.length < MIN_LENGTH) {
-    log('warn', `keyboard: ignored short input "${raw}"`);
+    log('warn', `${source}: ignored short input "${raw}"`);
     return;
   }
-  showBadge('keyboard reader', { 'Raw input': raw, 'Length': raw.length, ...interpretUid(raw) });
+  showBadge(source, { 'Raw input': raw, 'Length': raw.length, ...interpretUid(raw) });
+}
+
+// The test input reads the field's text rather than key events, so it also works when
+// Android delivers keys as "Unidentified" (IME input) instead of real characters.
+const testInput = $('test-input');
+let testInputTimer;
+
+testInput.addEventListener('input', () => {
+  clearTimeout(testInputTimer);
+  testInputTimer = setTimeout(flushTestInput, IDLE_FLUSH_MS * 2);
+});
+
+testInput.addEventListener('keydown', e => {
+  if (e.key === 'Enter' || e.key === 'Tab') {
+    e.preventDefault();
+    flushTestInput();
+  }
+});
+
+function flushTestInput() {
+  clearTimeout(testInputTimer);
+  const raw = testInput.value.trim();
+  testInput.value = '';
+  handleKeyboardValue(raw, 'test input');
 }
 
 // Readers differ in UID format (decimal vs hex, byte order), so show the common conversions.
