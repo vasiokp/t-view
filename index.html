@@ -1,0 +1,278 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Badge Reader POC</title>
+<style>
+  :root {
+    --bg: #10141a; --panel: #1a2029; --text: #e8edf3; --muted: #8a96a6;
+    --ok: #3ccf91; --warn: #f0b429; --err: #ff5d5d; --accent: #4da3ff;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: system-ui, sans-serif; background: var(--bg); color: var(--text); }
+  main { max-width: 960px; margin: 0 auto; padding: 24px 16px; display: grid; gap: 20px; }
+  header { text-align: center; }
+  #clock { font-size: clamp(48px, 12vw, 120px); font-weight: 600; font-variant-numeric: tabular-nums; }
+  #date { font-size: 22px; color: var(--muted); }
+  .panel { background: var(--panel); border-radius: 12px; padding: 16px 20px; }
+  .status { display: flex; flex-wrap: wrap; gap: 12px 32px; align-items: center; }
+  .status b { color: var(--muted); font-weight: 500; }
+  button { font: inherit; padding: 8px 16px; border: 0; border-radius: 8px; background: var(--accent); color: #fff; }
+  button:disabled { opacity: .4; }
+  #last { border-left: 6px solid var(--muted); min-height: 120px; }
+  #last.ok { border-color: var(--ok); }
+  #last.error { border-color: var(--err); }
+  #last h2 { margin: 0 0 12px; font-size: 20px; }
+  #last.error h2 { color: var(--err); }
+  table { border-collapse: collapse; width: 100%; }
+  td { padding: 6px 0; vertical-align: top; }
+  td:first-child { color: var(--muted); width: 200px; padding-right: 16px; }
+  td:last-child { font-family: ui-monospace, monospace; font-size: 18px; word-break: break-all; }
+  #log { margin: 0; padding-left: 20px; font-family: ui-monospace, monospace; font-size: 13px; max-height: 260px; overflow-y: auto; }
+  #log li { padding: 2px 0; }
+  #log .error { color: var(--err); }
+  #log .warn { color: var(--warn); }
+  #log .ok { color: var(--ok); }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <div id="clock"></div>
+    <div id="date"></div>
+  </header>
+
+  <section class="panel status">
+    <span><b>Keyboard reader:</b> <span id="kbd-status">listening</span></span>
+    <span><b>Web NFC:</b> <span id="nfc-status">checking…</span></span>
+    <button id="nfc-start" disabled>Start NFC scan</button>
+    <button id="copy-report">Copy report</button>
+  </section>
+
+  <section id="last" class="panel">
+    <h2>Waiting for badge…</h2>
+  </section>
+
+  <section class="panel">
+    <h2 style="margin-top:0;font-size:16px">Event log</h2>
+    <ol id="log" reversed></ol>
+  </section>
+
+  <section class="panel">
+    <h2 style="margin-top:0;font-size:16px">Diagnostics</h2>
+    <table id="diag"></table>
+  </section>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+
+// ---------- Clock ----------
+function tick() {
+  const now = new Date();
+  $('clock').textContent = now.toLocaleTimeString();
+  $('date').textContent = now.toLocaleDateString(undefined, { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' });
+}
+tick();
+setInterval(tick, 1000);
+
+// ---------- Output ----------
+function log(kind, message) {
+  const li = document.createElement('li');
+  li.className = kind;
+  li.textContent = `${new Date().toLocaleTimeString()}  ${message}`;
+  $('log').prepend(li);
+  while ($('log').children.length > 100) $('log').lastChild.remove();
+}
+
+function render(kind, title, fields) {
+  const card = $('last');
+  card.className = `panel ${kind}`;
+  card.replaceChildren();
+  const h2 = document.createElement('h2');
+  h2.textContent = title;
+  const table = document.createElement('table');
+  for (const [k, v] of Object.entries(fields)) {
+    const tr = table.insertRow();
+    tr.insertCell().textContent = k;
+    tr.insertCell().textContent = v;
+  }
+  card.append(h2, table);
+}
+
+function showBadge(source, fields) {
+  render('ok', `Badge read via ${source}`, { 'Read at': new Date().toLocaleString(), ...fields });
+  log('ok', `${source}: ${JSON.stringify(fields)}`);
+}
+
+function showError(source, err) {
+  const message = err instanceof Error ? `${err.name}: ${err.message}` : String(err);
+  render('error', `Error (${source})`, { 'At': new Date().toLocaleString(), 'Message': message });
+  log('error', `${source}: ${message}`);
+}
+
+window.addEventListener('error', e => showError('page', e.error || e.message));
+window.addEventListener('unhandledrejection', e => showError('page', e.reason));
+
+// ---------- Source 1: reader acting as a USB/HID keyboard ("keyboard wedge") ----------
+// Many built-in RFID/NFC readers type the badge UID as keystrokes followed by Enter.
+// Scanner input arrives in a fast burst; we flush on Enter/Tab or after a short idle gap.
+const IDLE_FLUSH_MS = 150;
+const MIN_LENGTH = 4; // ignore stray single keypresses
+let buffer = '';
+let flushTimer;
+
+let warnedUnidentified = false;
+
+document.addEventListener('keydown', e => {
+  clearTimeout(flushTimer);
+  // Android soft keyboards/IMEs report key "Unidentified" (keyCode 229) instead of real characters.
+  if ((e.key === 'Unidentified' || e.keyCode === 229) && !warnedUnidentified) {
+    warnedUnidentified = true;
+    log('warn', `keyboard: received key "${e.key}" (keyCode ${e.keyCode}) — reader may be sending input via IME, not HID`);
+  }
+  if (e.key === 'Enter' || e.key === 'Tab') {
+    e.preventDefault();
+    flushKeyboard();
+    return;
+  }
+  if (e.key.length === 1) {
+    e.preventDefault();
+    buffer += e.key;
+  }
+  flushTimer = setTimeout(flushKeyboard, IDLE_FLUSH_MS);
+});
+
+function flushKeyboard() {
+  clearTimeout(flushTimer);
+  const raw = buffer;
+  buffer = '';
+  if (!raw) return;
+  if (raw.length < MIN_LENGTH) {
+    log('warn', `keyboard: ignored short input "${raw}"`);
+    return;
+  }
+  showBadge('keyboard reader', { 'Raw input': raw, 'Length': raw.length, ...interpretUid(raw) });
+}
+
+// Readers differ in UID format (decimal vs hex, byte order), so show the common conversions.
+function interpretUid(raw) {
+  const out = {};
+  try {
+    if (/^\d+$/.test(raw)) {
+      out['As hex'] = BigInt(raw).toString(16).toUpperCase();
+    } else if (/^[0-9a-f]+$/i.test(raw) && raw.length % 2 === 0) {
+      out['As decimal'] = BigInt('0x' + raw).toString();
+      const reversed = raw.match(/../g).reverse().join('');
+      out['Byte-reversed hex'] = reversed.toUpperCase();
+      out['Byte-reversed decimal'] = BigInt('0x' + reversed).toString();
+    }
+  } catch (err) {
+    log('warn', `could not interpret "${raw}": ${err.message}`);
+  }
+  return out;
+}
+
+// ---------- Source 2: Web NFC (Chrome on Android, HTTPS only) ----------
+function initWebNfc() {
+  const status = $('nfc-status');
+  if (!window.isSecureContext) {
+    status.textContent = 'unavailable (page must be served over HTTPS)';
+    return;
+  }
+  if (!('NDEFReader' in window)) {
+    status.textContent = 'not supported by this browser';
+    return;
+  }
+  status.textContent = 'supported — press start';
+  const button = $('nfc-start');
+  button.disabled = false;
+  // scan() needs a user gesture the first time (permission prompt); once granted we can start automatically.
+  button.addEventListener('click', startScan);
+  navigator.permissions?.query({ name: 'nfc' })
+    .then(p => { if (p.state === 'granted') startScan(); })
+    .catch(err => log('warn', `Web NFC: permission query failed: ${err.message}`));
+
+  async function startScan() {
+    button.disabled = true;
+    try {
+      const reader = new NDEFReader();
+      reader.addEventListener('reading', ({ serialNumber, message }) => {
+        showBadge('Web NFC', { 'Serial number': serialNumber || '(none)', 'Records': message.records.length, ...describeRecords(message.records) });
+      });
+      reader.addEventListener('readingerror', () => {
+        showError('Web NFC', 'Tag detected but could not be read');
+      });
+      await reader.scan();
+      status.textContent = 'scanning';
+      log('ok', 'Web NFC: scan started');
+    } catch (err) {
+      status.textContent = 'failed to start';
+      button.disabled = false;
+      showError('Web NFC', err);
+    }
+  }
+}
+
+function describeRecords(records) {
+  const out = {};
+  records.forEach((r, i) => {
+    let value;
+    if (r.recordType === 'text' || r.recordType === 'url' || r.recordType === 'absolute-url') {
+      value = new TextDecoder(r.encoding || 'utf-8').decode(r.data);
+    } else if (r.data) {
+      value = [...new Uint8Array(r.data.buffer)].map(b => b.toString(16).padStart(2, '0')).join(' ');
+    } else {
+      value = '(empty)';
+    }
+    out[`Record ${i + 1} (${r.recordType}${r.mediaType ? ', ' + r.mediaType : ''})`] = value;
+  });
+  return out;
+}
+
+// ---------- Diagnostics & report (for remote testers) ----------
+function diagnostics() {
+  return {
+    'URL': location.href,
+    'User agent': navigator.userAgent,
+    'Secure context (HTTPS)': String(window.isSecureContext),
+    'Web NFC (NDEFReader)': String('NDEFReader' in window),
+    'Screen': `${screen.width}x${screen.height} @${devicePixelRatio}x`,
+    'Language / time zone': `${navigator.language} / ${Intl.DateTimeFormat().resolvedOptions().timeZone}`,
+  };
+}
+
+function renderDiagnostics() {
+  const table = $('diag');
+  for (const [k, v] of Object.entries(diagnostics())) {
+    const tr = table.insertRow();
+    tr.insertCell().textContent = k;
+    tr.insertCell().textContent = v;
+  }
+}
+
+$('copy-report').addEventListener('click', async () => {
+  const diag = Object.entries(diagnostics()).map(([k, v]) => `${k}: ${v}`).join('\n');
+  const events = [...$('log').children].map(li => li.textContent).reverse().join('\n');
+  const report = `BADGE READER POC REPORT\n${new Date().toISOString()}\n\n${diag}\n\nEVENTS\n${events}`;
+  try {
+    await navigator.clipboard.writeText(report);
+    log('ok', 'report copied to clipboard');
+  } catch {
+    // Clipboard API is unavailable over plain HTTP — fall back to a selectable text box.
+    const ta = document.createElement('textarea');
+    ta.value = report;
+    ta.style.cssText = 'width:100%;height:240px';
+    $('diag').after(ta);
+    ta.select();
+    log('warn', 'clipboard unavailable — report shown below diagnostics, copy it manually');
+  }
+});
+
+renderDiagnostics();
+initWebNfc();
+log('ok', 'page loaded');
+</script>
+</body>
+</html>
