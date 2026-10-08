@@ -47,8 +47,6 @@
 
   <section class="panel status">
     <span><b>Keyboard reader:</b> <span id="kbd-status">listening</span></span>
-    <span><b>Web NFC:</b> <span id="nfc-status">checking…</span></span>
-    <button id="nfc-start" disabled>Start NFC scan</button>
     <button id="copy-report">Copy report</button>
   </section>
 
@@ -211,70 +209,12 @@ function interpretUid(raw) {
   return out;
 }
 
-// ---------- Source 2: Web NFC (Chrome on Android, HTTPS only) ----------
-function initWebNfc() {
-  const status = $('nfc-status');
-  if (!window.isSecureContext) {
-    status.textContent = 'unavailable (page must be served over HTTPS)';
-    return;
-  }
-  if (!('NDEFReader' in window)) {
-    status.textContent = 'not supported by this browser';
-    return;
-  }
-  status.textContent = 'supported — press start';
-  const button = $('nfc-start');
-  button.disabled = false;
-  // scan() needs a user gesture the first time (permission prompt); once granted we can start automatically.
-  button.addEventListener('click', startScan);
-  navigator.permissions?.query({ name: 'nfc' })
-    .then(p => { if (p.state === 'granted') startScan(); })
-    .catch(err => log('warn', `Web NFC: permission query failed: ${err.message}`));
-
-  async function startScan() {
-    button.disabled = true;
-    try {
-      const reader = new NDEFReader();
-      reader.addEventListener('reading', ({ serialNumber, message }) => {
-        showBadge('Web NFC', { 'Serial number': serialNumber || '(none)', 'Records': message.records.length, ...describeRecords(message.records) });
-      });
-      reader.addEventListener('readingerror', () => {
-        showError('Web NFC', 'Tag detected but could not be read');
-      });
-      await reader.scan();
-      status.textContent = 'scanning';
-      log('ok', 'Web NFC: scan started');
-    } catch (err) {
-      status.textContent = 'failed to start';
-      button.disabled = false;
-      showError('Web NFC', err);
-    }
-  }
-}
-
-function describeRecords(records) {
-  const out = {};
-  records.forEach((r, i) => {
-    let value;
-    if (r.recordType === 'text' || r.recordType === 'url' || r.recordType === 'absolute-url') {
-      value = new TextDecoder(r.encoding || 'utf-8').decode(r.data);
-    } else if (r.data) {
-      value = [...new Uint8Array(r.data.buffer)].map(b => b.toString(16).padStart(2, '0')).join(' ');
-    } else {
-      value = '(empty)';
-    }
-    out[`Record ${i + 1} (${r.recordType}${r.mediaType ? ', ' + r.mediaType : ''})`] = value;
-  });
-  return out;
-}
-
 // ---------- Diagnostics & report (for remote testers) ----------
 function diagnostics() {
   return {
     'URL': location.href,
     'User agent': navigator.userAgent,
     'Secure context (HTTPS)': String(window.isSecureContext),
-    'Web NFC (NDEFReader)': String('NDEFReader' in window),
     'Screen': `${screen.width}x${screen.height} @${devicePixelRatio}x`,
     'Language / time zone': `${navigator.language} / ${Intl.DateTimeFormat().resolvedOptions().timeZone}`,
   };
@@ -308,7 +248,6 @@ $('copy-report').addEventListener('click', async () => {
 });
 
 renderDiagnostics();
-initWebNfc();
 log('ok', 'page loaded');
 </script>
 </body>
