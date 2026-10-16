@@ -247,7 +247,10 @@ function initWebNfc() {
       reader.addEventListener('reading', ({ serialNumber, message }) => {
         // serialNumber is colon-separated hex ("04:a1:2b:..."); strip it so it gets the same conversions as keyboard input.
         const uid = (serialNumber || '').replace(/:/g, '');
+        // Our badge system uses the byte-reversed UID as a decimal number (aa:ed:90:e7 → 3885034922).
+        const badgeNumber = interpretUid(uid)['Byte-reversed decimal'];
         showBadge('Web NFC', {
+          'Badge number': badgeNumber || '(unknown)',
           'Serial number': serialNumber || '(none)',
           ...(uid ? interpretUid(uid) : {}),
           'Records': message.records.length,
