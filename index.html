@@ -108,8 +108,12 @@ function render(kind, title, fields) {
   card.append(h2, table);
 }
 
+// Counts every read, so repeated taps of the same badge are visibly distinct.
+let scanCount = 0;
+
 function showBadge(source, fields) {
-  render('ok', `Badge read via ${source}`, { 'Read at': new Date().toLocaleString(), ...fields });
+  scanCount++;
+  render('ok', `Badge read via ${source}`, { 'Scan #': scanCount, 'Read at': new Date().toLocaleString(), ...fields });
   log('ok', `${source}: ${JSON.stringify(fields)}`);
 }
 
@@ -231,7 +235,12 @@ function initWebNfc() {
     .then(p => { if (p.state === 'granted') startScan(); })
     .catch(err => log('warn', `Web NFC: permission query failed: ${err.message}`));
 
+  // The auto-start and a button click can both fire; a second reader would report every tap twice.
+  let started = false;
+
   async function startScan() {
+    if (started) return;
+    started = true;
     button.disabled = true;
     try {
       const reader = new NDEFReader();
@@ -254,6 +263,7 @@ function initWebNfc() {
       log('ok', 'Web NFC: scan started');
     } catch (err) {
       status.textContent = 'failed to start';
+      started = false;
       button.disabled = false;
       showError('Web NFC', err);
     }
